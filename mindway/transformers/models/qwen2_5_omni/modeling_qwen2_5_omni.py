@@ -61,7 +61,6 @@ from .configuration_qwen2_5_omni import (
 
 if is_flash_attn_2_available:
     from mindspore.ops.operations.nn_ops import FlashAttentionScore as MSFlashAttention
-from mindspore.ops.auto_generate import PagedAttention
 
 from ...mindspore_adapter import dtype_to_min, scaled_dot_product_attention
 from ...mindspore_adapter.utils import _MIN_FP16
@@ -689,6 +688,8 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Cell):
     def __init__(self, config: Qwen2_5OmniAudioEncoderConfig):
         super().__init__()
         self.embed_dim = config.d_model
+        if config._attn_implementation == "paged_attention":
+            config._attn_implementation = "flash_attention_2"
         self.self_attn = QWEN2_5_OMNI_AUDIO_ATTENTION_CLASSES[config._attn_implementation](config)
         self.self_attn_layer_norm = mint.nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -1081,6 +1082,8 @@ class Qwen2_5OmniVisionBlock(nn.Cell):
         super().__init__()
         self.norm1 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
+        if config._attn_implementation == "paged_attention":
+            config._attn_implementation = "flash_attention_2"
         self.attn = QWEN2_5_OMNI_VISION_ATTENTION_CLASSES[config._attn_implementation](
             config.hidden_size, num_heads=config.num_heads
         )
@@ -1750,32 +1753,6 @@ class Qwen2_5OmniPagedAttention(Qwen2_5OmniAttention):
     def __init__(self, config, layer_idx: None):
         super().__init__(config, layer_idx)
 
-
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.is_causal = True
-        self.attention_dropout = config.attention_dropout
-        self.rope_scaling = config.rope_scaling
-
-        self.q_proj = mint.nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = mint.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = mint.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = mint.nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-        self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
-
         dropout_rate = 0.0 if not self.training else self.attention_dropout
         self.infer_attention = InferAttention(
             n_head=self.num_heads,
@@ -1799,6 +1776,7 @@ class Qwen2_5OmniPagedAttention(Qwen2_5OmniAttention):
 
         self.is_first_iteration = True
 
+    @jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -2353,10 +2331,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         if self.config._attn_implementation == "paged_attention":
             self.freqs_mgr = FreqsMgr(
-                head_dim=config.text_config.hidden_size // config.num_attention_heads,
+                head_dim=config.text_config.hidden_size // config.text_config.num_attention_heads,
                 seq_length=config.text_config.max_position_embeddings,
                 max_position_embedding=config.text_config.max_position_embeddings,
-                rotary_dtype=config.mindspore_dtype,
+                rotary_dtype=ms.float16, # config.mindspore_dtype,
                 theta=config.text_config.rope_theta,
                 is_dynamic=True,
             )
@@ -2364,7 +2342,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             self.casual_mask = LowerTriangularMaskWithDynamic(
                 seq_length=config.text_config.max_position_embeddings,
                 batch_size=1,
-                compute_type=config.mindspore_dtype,
+                compute_type=ms.float16, # config.mindspore_dtype,
                 is_dynamic=True,
                 pad_token_id=config.text_config.pad_token_id,
                 use_flash_attention=True,
@@ -3760,7 +3738,8 @@ class DiTAttention(nn.Cell):
         self.to_v = mint.nn.Linear(config.hidden_size, self.inner_dim)
 
         self.to_out = nn.CellList([mint.nn.Linear(self.inner_dim, config.hidden_size), mint.nn.Dropout(config.dropout)])
-
+        if self._attn_implementation == "paged_attention":
+            self._attn_implementation = "flash_attention_2"
         if self._attn_implementation == "flash_attention_2":
             self.fa_dtype = ms.float16
             self.attention_interface = MSFlashAttention(
@@ -4440,7 +4419,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
     def __init__(self, config: Qwen2_5OmniToken2WavConfig):
         super().__init__(config)
         attn_impl = config._attn_implementation
-        if config._attn_implementation == "flash_attention_2":
+        if config._attn_implementation == "flash_attention_2" or config._attn_implementation == "paged_attention":
             logger.warning_once(
                 "Qwen2_5OmniToken2WavModel must inference with fp32, but flash_attention_2 only supports fp16 and bf16, "
                 "attention implementation of Qwen2_5OmniToken2WavModel will fallback to sdpa."
@@ -4519,7 +4498,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
     def enable_talker(self):
         self.config.thinker_config._attn_implementation = self.config._attn_implementation
-        self.config.token2wav_config._attn_implementation = self.token2wav_config._attn_implementation
+        self.config.token2wav_config._attn_implementation = self.config._attn_implementation
         self.talker = Qwen2_5OmniTalkerForConditionalGeneration(self.config.talker_config)
         self.token2wav = Qwen2_5OmniToken2WavModel(self.config.token2wav_config)
         self.token2wav.float()
