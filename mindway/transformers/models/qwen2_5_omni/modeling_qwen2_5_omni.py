@@ -36,7 +36,7 @@ from transformers.utils.hub import cached_file
 import mindspore as ms
 import mindspore.mint as mint
 import mindspore.mint.nn.functional as F
-from mindspore import Parameter, nn, ops
+from mindspore import Parameter, nn, ops, jit
 from mindspore.common.initializer import Normal, initializer
 
 from ...activations import ACT2FN
@@ -61,9 +61,14 @@ from .configuration_qwen2_5_omni import (
 
 if is_flash_attn_2_available:
     from mindspore.ops.operations.nn_ops import FlashAttentionScore as MSFlashAttention
+from mindspore.ops.auto_generate import PagedAttention
 
 from ...mindspore_adapter import dtype_to_min, scaled_dot_product_attention
 from ...mindspore_adapter.utils import _MIN_FP16
+from ...mindspore_adapter.block_tables import BlockTables
+from ...mindspore_adapter.freqs import FreqsMgr
+from ...mindspore_adapter.infer_attention import InferAttention
+from ...mindspore_adapter.mask import LowerTriangularMaskWithDynamic
 
 _MAX_FP16 = ms.tensor(np.finfo(np.float16).max, dtype=ms.float16)
 
@@ -1735,10 +1740,114 @@ class Qwen2_5OmniSdpaAttention(Qwen2_5OmniAttention):
         return attn_output, None, past_key_value
 
 
+class Qwen2_5OmniPagedAttention(Qwen2_5OmniAttention):
+    """
+    Qwen2_5Omni paged attention module, following Qwen2_5Omni attention module. This module inherits from `Qwen2_5OmniAttention`
+    as the weights of the module stays untouched. The only required change would be on the forward pass
+    where it needs to correctly call the public API of flash attention in case the input contains any of them.
+    """
+
+    def __init__(self, config, layer_idx: None):
+        super().__init__(config, layer_idx)
+
+
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.is_causal = True
+        self.attention_dropout = config.attention_dropout
+        self.rope_scaling = config.rope_scaling
+
+        self.q_proj = mint.nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj = mint.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj = mint.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.o_proj = mint.nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
+
+        dropout_rate = 0.0 if not self.training else self.attention_dropout
+        self.infer_attention = InferAttention(
+            n_head=self.num_heads,
+            head_dim=self.head_dim,
+            n_kv_head=self.num_key_value_heads,
+            seq_length=config.max_position_embeddings,
+            pa_n_head_split=self.num_heads,
+            pa_n_kv_head_split=self.head_dim,
+            keep_prob=1 - dropout_rate,
+            scale_value=self.head_dim**-0.5,
+            pre_tokens=2147483647,
+            next_tokens=0,
+            block_size=32,
+            num_blocks=1024,
+            is_dynamic=True, # input_layout = "TH"
+            use_flash_attention=True,
+            rotary_cos_format=2,
+            compute_dtype=ms.float16, # FA dtype
+            use_rope_rotary_emb=False,
+        )
+
+        self.is_first_iteration = True
+
+    def construct(
+        self,
+        hidden_states: ms.Tensor,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[ms.Tensor] = None,
+        position_embeddings: Optional[Tuple[ms.Tensor, ms.Tensor]] = None,  # necessary, but kept here for BC
+        block_tables: Optional[ms.Tensor] = None,
+        slot_mapping: Optional[ms.Tensor] = None,
+        freqs_cis: Optional[ms.Tensor] = None,
+        mask: Optional[ms.Tensor] = None,
+        batch_valid_length: Optional[ms.Tensor] = None,
+    ):
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        cos, sin, _ = freqs_cis
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        )
+
+        attention_mask = self.convert_mask_to_fa_format(attention_mask)
+        attn_output = self.infer_attention(
+            query_states,
+            key_states,
+            value_states,
+            batch_valid_length,
+            block_tables,
+            slot_mapping,
+            freqs_cis,
+            mask,
+            q_seq_lens=None,
+        )
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
 QWEN2_5_OMNI_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniAttention,
     "flash_attention_2": Qwen2_5OmniFlashAttention2,
     "sdpa": Qwen2_5OmniSdpaAttention,
+    "paged_attention": Qwen2_5OmniPagedAttention
 }
 
 
@@ -1864,6 +1973,8 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
 
+        self.is_first_iteration = True
+
         self.gradient_checkpointing = False  # TODO
         # Initialize weights and apply final processing
         self.post_init()
@@ -1886,6 +1997,11 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[ms.Tensor] = None,
+        block_tables: Optional[ms.Tensor] = None,
+        slot_mapping: Optional[ms.Tensor] = None,
+        freqs_cis: Optional[ms.Tensor] = None,
+        mask: Optional[ms.Tensor] = None,
+        batch_valid_length: Optional[ms.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1923,9 +2039,13 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].broadcast_to((3, position_ids.shape[0], -1))
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        if block_tables is None:
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
+        else:
+            causal_mask = attention_mask
+
 
         hidden_states = inputs_embeds
 
@@ -1941,19 +2061,6 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # if self.gradient_checkpointing and self.training:
-            #     layer_outputs = self._gradient_checkpointing_func(
-            #         decoder_layer.__call__,
-            #         hidden_states,
-            #         causal_mask,
-            #         position_ids,
-            #         past_key_values,
-            #         output_attentions,
-            #         use_cache,
-            #         cache_position,
-            #         position_embeddings,
-            #     )
-            # else:
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -1963,6 +2070,11 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                block_tables=block_tables,
+                slot_mapping=slot_mapping,
+                freqs_cis=freqs_cis,
+                mask=mask,
+                batch_valid_length=batch_valid_length,
             )
 
             hidden_states = layer_outputs[0]
@@ -2239,11 +2351,45 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.rope_deltas = None
         self.post_init()
 
+        if self.config._attn_implementation == "paged_attention":
+            self.freqs_mgr = FreqsMgr(
+                head_dim=config.text_config.hidden_size // config.num_attention_heads,
+                seq_length=config.text_config.max_position_embeddings,
+                max_position_embedding=config.text_config.max_position_embeddings,
+                rotary_dtype=config.mindspore_dtype,
+                theta=config.text_config.rope_theta,
+                is_dynamic=True,
+            )
+
+            self.casual_mask = LowerTriangularMaskWithDynamic(
+                seq_length=config.text_config.max_position_embeddings,
+                batch_size=1,
+                compute_type=config.mindspore_dtype,
+                is_dynamic=True,
+                pad_token_id=config.text_config.pad_token_id,
+                use_flash_attention=True,
+                use_attn_mask_compression=False,
+                use_past=True,
+                seq_split_num=1,
+                chunk_prefill=False,
+            )
+
+            self.is_first_iteration = True
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
+
+    def add_flags_custom(self, is_first_iteration):
+        """Add customized attributes for specific cells in the model."""
+        self.add_flags(is_first_iteration=is_first_iteration)
+        self.model.add_flags(is_first_iteration=is_first_iteration)
+        for layer in self.model.layers:
+            layer.add_flags(is_first_iteration=is_first_iteration)
+            layer.self_attn.infer_attention.add_flags(is_first_iteration=is_first_iteration)
+            layer.self_attn.infer_attention.paged_attention_mgr.add_flags(is_first_iteration=is_first_iteration)
 
     @add_start_docstrings_to_model_forward(QWEN2_5OMNITHINKER_INPUTS_DOCSTRING)
     @replace_return_docstrings(
@@ -2272,6 +2418,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         use_audio_in_video: Optional[bool] = None,
         cache_position: Optional[ms.Tensor] = None,
         video_second_per_grid: Optional[ms.Tensor] = None,
+        block_tables: Optional[ms.Tensor] = None,
+        slot_mapping: Optional[ms.Tensor] = None,
+        batch_valid_length: Optional[ms.Tensor] = None,
     ) -> Union[Tuple, Qwen2_5OmniThinkerCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2323,6 +2472,17 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         >>> response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         ```"""
+        if block_tables is not None:
+            bs, seq_len = input_ids.shape
+            mask = None
+            if self.is_first_iteration:
+                freqs_cis = self.freqs_mgr.prefill(bs, seq_len)
+                mask = self.casual_mask.prefill()
+            else:
+                freqs_cis = self.freqs_mgr.increment(batch_valid_length)
+        else:
+            freqs_cis = None
+            mask = None
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2410,6 +2570,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            freqs_cis=freqs_cis,
+            mask=mask,
+            batch_valid_length=batch_valid_length,
         )
 
         hidden_states = outputs[0]
@@ -2433,6 +2598,41 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
+
+    def enable_dynamic_shape(self):
+        input_ids = ms.Tensor(shape=[None, None], dtype=ms.int32)
+        position_ids = ms.Tensor(shape=[None, None], dtype=ms.int32)
+        attention_mask = ms.Tensor(shape=[None, None], dtype=ms.int32)
+        past_key_values = None
+        inputs_embeds = None
+        labels = None
+        use_cache = False
+        output_attentions = False
+        output_hidden_states = False
+        return_dict = False
+        cache_position = ms.Tensor(shape=[None], dtype=ms.int64)
+        block_tables = ms.Tensor(shape=[None, None], dtype=ms.int32)
+        slot_mapping = ms.Tensor(shape=[None], dtype=ms.int32)
+        batch_valid_length = ms.mutable(ms.Tensor(shape=[None], dtype=ms.int32))
+
+        self.set_inputs(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds,
+            labels,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+            cache_position,
+            block_tables,
+            slot_mapping,
+            batch_valid_length,
+        )
+
+
 
     def prepare_inputs_for_generation(
         self,
@@ -2477,6 +2677,54 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+
+        if self.config._attn_implementation == "paged_attention":
+            bs, seq_len = input_ids.shape
+            step = kwargs["step"]
+            if step == 0:
+                self.enable_dynamic_shape()
+
+                # init block tables
+                self.block_mgr = BlockTables(1024, 32, self.config.max_position_embeddings)
+                self.block_mgr.init_cache_engine(bs)
+
+                # get slot mapping and block tables
+                max_input_length = self.config.max_position_embeddings
+                self.valid_length_each_example = ms.tensor(seq_len).reshape(bs)
+                block_tables, slot_mapping = self.block_mgr.assemble_pa_full_inputs(
+                    max_input_length, self.valid_length_each_example, [False]
+                )
+                slot_mapping = np.delete(slot_mapping, np.where(slot_mapping == -1))
+
+                # set batch valid length
+                self.batch_valid_length = ms.tensor(seq_len).to(ms.int32).reshape(bs)
+
+                self.phase = "prefill"
+                self.add_flags_custom(True)
+            else:
+                model_inputs.update({"input_ids": input_ids[:, -1].reshape(bs, 1)})
+
+                # get slot mapping and block tables
+                self.valid_length_each_example += 1
+                block_tables, slot_mapping = self.block_mgr.assemble_pa_inc_inputs(
+                    self.valid_length_each_example, [False]
+                )
+
+                # set batch valid length
+                self.batch_valid_length += 1
+
+                if step == 1:
+                    self.phase = "increment"
+                    self.add_flags_custom(False)
+            slot_mapping = ms.tensor(slot_mapping)
+            block_tables = ms.tensor(block_tables)
+            model_inputs.update(
+                {
+                    "block_tables": block_tables,
+                    "slot_mapping": slot_mapping,
+                    "batch_valid_length": self.batch_valid_length,
+                }
+            )
 
         return model_inputs
 
@@ -4535,6 +4783,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         )
 
         return thinker_result.sequences, wav.float()
+
 
 
 __all__ = [
